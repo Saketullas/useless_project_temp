@@ -1,0 +1,399 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Motion Tracker — Everything That Moves</title>
+  <style>
+    :root {
+      --accent: #00d084;
+      --bg: #ffffff;
+      --panel: rgba(0,0,0,0.06);
+    }
+    html,body { height:100%; margin:0; font-family:Inter,system-ui,Arial; background:var(--bg); color:#222; }
+    .wrap { display:flex; flex-direction:column; align-items:center; gap:12px; padding:12px; }
+    .viewer { position:relative; width:90vw; max-width:900px; aspect-ratio:16/9; background:#000; border-radius:12px; overflow:hidden; box-shadow:0 6px 30px rgba(0,0,0,0.12); }
+    video, canvas { position:absolute; left:0; top:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); } /* mirror for user */
+    .controls { width:90vw; max-width:900px; display:flex; gap:8px; align-items:center; background:var(--panel); padding:10px; border-radius:10px; }
+    .col { display:flex; flex-direction:column; gap:8px; }
+    label { font-size:14px; }
+    input[type=range] { width:180px; }
+    button { padding:8px 12px; border-radius:8px; border:none; background:var(--accent); color:#033; cursor:pointer; font-weight:600; }
+    .secondary { background:#eee; color:#111; border:1px solid #ddd; }
+    .status { font-size:14px; margin-left:auto; color:#444; }
+    .log { font-size:13px; max-width:900px; width:90vw; color:#333; margin-top:6px; }
+    .small { font-size:12px; color:#666; }
+    .badge { background:#111; color:#fff; padding:4px 8px; border-radius:999px; font-weight:700; margin-left:6px;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Mayday Mayday — Motion Tracker (everything that moves)</h2>
+
+    <div class="viewer" id="viewer">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="controls">
+      <div class="col">
+        <button id="startBtn">Start</button>
+      </div>
+
+      <div class="col">
+        <button id="stopBtn" class="secondary">Stop</button>
+      </div>
+
+      <div class="col">
+        <label>Sensitivity <span class="small" id="sensVal">22</span></label>
+        <input id="sensitivity" type="range" min="6" max="60" value="22">
+      </div>
+
+      <div class="col">
+        <label>Min area <span class="small" id="minAVal">6</span></label>
+        <input id="minArea" type="range" min="1" max="200" value="6">
+      </div>
+
+      <div class="col">
+        <label>Max area <span class="small" id="maxAVal">1200</span></label>
+        <input id="maxArea" type="range" min="50" max="20000" value="1200">
+      </div>
+
+      <div class="col">
+        <label>Frame skip <span class="small" id="skipVal">1</span></label>
+        <input id="frameSkip" type="range" min="1" max="6" value="1">
+      </div>
+
+      <div class="col">
+        <button id="screenshot" class="secondary">Screenshot</button>
+      </div>
+
+      <div class="status">
+        Active: <span id="activeCount" class="badge">0</span>
+        Total: <span id="totalCount" class="badge">0</span>
+      </div>
+    </div>
+
+    <div class="log small" id="log">Tip: open in new tab if camera is blocked by editor preview. Good lighting + still background improves insect detection.</div>
+  </div>
+
+<script>
+/*
+ Motion Tracker (everything that moves) — single-file.
+ - Frame-difference on a low-res processing canvas
+ - Connected components flood-fill to find blobs
+ - Centroid tracker to give stable IDs
+ - Controls for sensitivity, min/max area, frame skip
+ Notes:
+ - For best small-object detection: point camera at a still wall/ceiling, strong diffuse lighting.
+ - If your editor blocks camera in iframe, open in new tab.
+*/
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+
+const sensitivitySlider = document.getElementById('sensitivity');
+const minAreaSlider = document.getElementById('minArea');
+const maxAreaSlider = document.getElementById('maxArea');
+const frameSkipSlider = document.getElementById('frameSkip');
+const sensVal = document.getElementById('sensVal');
+const minAVal = document.getElementById('minAVal');
+const maxAVal = document.getElementById('maxAVal');
+const skipVal = document.getElementById('skipVal');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const screenshotBtn = document.getElementById('screenshot');
+const activeCountEl = document.getElementById('activeCount');
+const totalCountEl = document.getElementById('totalCount');
+
+sensVal.innerText = sensitivitySlider.value;
+minAVal.innerText = minAreaSlider.value;
+maxAVal.innerText = maxAreaSlider.value;
+skipVal.innerText = frameSkipSlider.value;
+
+sensitivitySlider.oninput = () => sensVal.innerText = sensitivitySlider.value;
+minAreaSlider.oninput = () => minAVal.innerText = minAreaSlider.value;
+maxAreaSlider.oninput = () => maxAVal.innerText = maxAreaSlider.value;
+frameSkipSlider.oninput = () => skipVal.innerText = frameSkipSlider.value;
+
+let PROC_W = 240, PROC_H = 160; // processing resolution — small for speed; change if you need more detail
+const procCanvas = document.createElement('canvas');
+procCanvas.width = PROC_W; procCanvas.height = PROC_H;
+const pctx = procCanvas.getContext('2d');
+
+let prevGray = new Uint8ClampedArray(PROC_W * PROC_H);
+let visited = new Uint8Array(PROC_W * PROC_H); // for flood fill
+let running = false;
+let frameIndex = 0;
+
+// tracker
+let trackers = {}; // id -> {x,y,lastSeen}
+let nextId = 1;
+let totalSeen = 0;
+
+// helper to start camera
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    // setup overlay to match video display size
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+    // ensure proper scaling ratio for processing
+    const scaleX = overlay.width / PROC_W;
+    const scaleY = overlay.height / PROC_H;
+    running = true;
+    frameIndex = 0;
+    requestAnimationFrame(loop);
+  } catch (e) {
+    alert("Camera access denied or unavailable. Open page in a new tab and allow camera.");
+    console.error(e);
+  }
+}
+
+function stopCamera() {
+  running = false;
+  const s = video.srcObject;
+  if (s && s.getTracks) s.getTracks().forEach(t => t.stop());
+  video.srcObject = null;
+  trackers = {}; nextId = 1; totalSeen = 0;
+  updateCounts();
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+}
+
+// convert ImageData to gray (0..255)
+function toGray(imageData, outGray) {
+  const d = imageData.data;
+  let j = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    // luminance
+    outGray[j++] = (0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2]) | 0;
+  }
+}
+
+// flood-fill connected components in mask, returns detections in processing coords
+function findBlobs(mask, minArea, maxArea) {
+  visited.fill(0);
+  const detections = [];
+  const W = PROC_W, H = PROC_H;
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i] && !visited[i]) {
+      // bfs/stack
+      let stack = [i];
+      visited[i] = 1;
+      let minX = W, minY = H, maxX = 0, maxY = 0, area = 0;
+      while (stack.length) {
+        const idx = stack.pop();
+        area++;
+        const x = idx % W;
+        const y = (idx / W) | 0;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        // 8-neighbors
+        for (let ny = y-1; ny <= y+1; ny++) {
+          for (let nx = x-1; nx <= x+1; nx++) {
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const ni = ny * W + nx;
+            if (mask[ni] && !visited[ni]) {
+              visited[ni] = 1;
+              stack.push(ni);
+            }
+          }
+        }
+      }
+      if (area >= minArea && area <= maxArea) {
+        detections.push({
+          minX, minY, maxX, maxY, area,
+          cx: (minX + maxX) / 2,
+          cy: (minY + maxY) / 2
+        });
+      }
+    }
+  }
+  return detections;
+}
+
+// simple centroid tracker: match detections to trackers by distance
+function updateTrackers(detections) {
+  const distThresh = 30; // in processing pixels (tune)
+  const usedDet = new Array(detections.length).fill(false);
+
+  // match existing trackers
+  for (const id in trackers) {
+    const t = trackers[id];
+    let best = -1;
+    let bestD = Infinity;
+    for (let i = 0; i < detections.length; i++) {
+      if (usedDet[i]) continue;
+      const d = detections[i];
+      const dx = d.cx - t.x;
+      const dy = d.cy - t.y;
+      const dd = dx*dx + dy*dy;
+      if (dd < bestD) { bestD = dd; best = i; }
+    }
+    if (best !== -1 && bestD <= distThresh*distThresh) {
+      // update tracker
+      trackers[id].x = detections[best].cx;
+      trackers[id].y = detections[best].cy;
+      trackers[id].lastSeen = frameIndex;
+      usedDet[best] = true;
+    }
+    // else keep tracker until stale
+  }
+
+  // create trackers for unmatched detections
+  for (let i = 0; i < detections.length; i++) {
+    if (usedDet[i]) continue;
+    const det = detections[i];
+    const id = nextId++;
+    trackers[id] = { x: det.cx, y: det.cy, lastSeen: frameIndex };
+    totalSeen++;
+  }
+
+  // remove stale trackers (not seen for a while)
+  const maxMiss = 18; // frames
+  for (const id in trackers) {
+    if ((frameIndex - trackers[id].lastSeen) > maxMiss) {
+      delete trackers[id];
+    }
+  }
+}
+
+function drawOverlays(detections) {
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  // draw detections (processing -> display)
+  const scaleX = overlay.width / PROC_W;
+  const scaleY = overlay.height / PROC_H;
+
+  // draw bounding boxes for detected blobs
+  ctx.strokeStyle = 'rgba(255,60,60,0.9)';
+  ctx.lineWidth = Math.max(2, Math.floor(2 * (overlay.width/640)));
+  for (const d of detections) {
+    const x = d.minX*scaleX, y = d.minY*scaleY;
+    const w = (d.maxX - d.minX)*scaleX, h = (d.maxY - d.minY)*scaleY;
+    ctx.strokeRect(x, y, w, h);
+  }
+
+  // draw trackers
+  ctx.fillStyle = 'rgba(0,200,150,0.9)';
+  ctx.font = `${14 * (overlay.width/640)}px monospace`;
+  for (const id in trackers) {
+    const t = trackers[id];
+    const tx = t.x * scaleX, ty = t.y * scaleY;
+    // dot
+    ctx.beginPath();
+    ctx.arc(tx, ty, 6, 0, Math.PI*2);
+    ctx.fill();
+    // id label
+    ctx.fillStyle = '#fff';
+    ctx.fillText('#' + id, tx + 8, ty - 8);
+    ctx.fillStyle = 'rgba(0,200,150,0.9)';
+  }
+  updateCounts();
+}
+
+function updateCounts() {
+  activeCountEl.innerText = Object.keys(trackers).length;
+  totalCountEl.innerText = totalSeen;
+}
+
+function captureProcessingFrame() {
+  // draw scaled-down video to processing canvas
+  pctx.drawImage(video, 0, 0, PROC_W, PROC_H);
+  return pctx.getImageData(0,0,PROC_W,PROC_H);
+}
+
+// main loop
+function loop() {
+  if (!running) return;
+  frameIndex++;
+  const skip = Number(frameSkipSlider.value) || 1;
+  if ((frameIndex % skip) !== 0) {
+    requestAnimationFrame(loop);
+    return;
+  }
+
+  const imageData = captureProcessingFrame();
+  const gray = new Uint8ClampedArray(PROC_W * PROC_H);
+  toGray(imageData, gray);
+
+  // compute mask: abs diff > sensitivity
+  const sensitivity = Number(sensitivitySlider.value);
+  const mask = new Uint8ClampedArray(PROC_W * PROC_H);
+  for (let i=0;i<gray.length;i++){
+    const d = Math.abs(gray[i] - prevGray[i]);
+    mask[i] = (d > sensitivity) ? 1 : 0;
+    prevGray[i] = gray[i];
+  }
+
+  // small morphological: remove isolated pixels (1-neighbor rule)
+  for (let y=1; y<PROC_H-1; y++){
+    for (let x=1; x<PROC_W-1; x++){
+      const i = y*PROC_W + x;
+      if (mask[i]) {
+        let n=0;
+        if (mask[i-1]) n++; if (mask[i+1]) n++; if (mask[i-PROC_W]) n++; if (mask[i+PROC_W]) n++;
+        if (n < 1) mask[i] = 0;
+      }
+    }
+  }
+
+  const minArea = Math.max(1, Number(minAreaSlider.value));
+  const maxArea = Math.max(minArea, Number(maxAreaSlider.value));
+  const detections = findBlobs(mask, minArea, maxArea);
+
+  updateTrackers(detections);
+  drawOverlays(detections);
+
+  requestAnimationFrame(loop);
+}
+
+// Start/Stop/Screenshot handlers
+startBtn.onclick = async () => {
+  if (!running) {
+    await startCamera();
+    startBtn.innerText = 'Running';
+    startBtn.disabled = true;
+  }
+};
+stopBtn.onclick = () => {
+  stopCamera();
+  startBtn.innerText = 'Start';
+  startBtn.disabled = false;
+};
+
+screenshotBtn.onclick = () => {
+  // capture overlay + video into image
+  const tmp = document.createElement('canvas');
+  tmp.width = overlay.width; tmp.height = overlay.height;
+  const tctx = tmp.getContext('2d');
+  // draw video then overlay
+  tctx.drawImage(video, 0, 0, tmp.width, tmp.height);
+  tctx.drawImage(overlay, 0, 0, tmp.width, tmp.height);
+  const data = tmp.toDataURL('image/png');
+  const a = document.createElement('a');
+  a.href = data; a.download = 'motion-screenshot.png';
+  a.click();
+};
+
+// Auto-stop when page hidden to save resources
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && running) {
+    // optional: stopCamera();
+  }
+});
+
+// initialize prevGray to mid-gray
+for (let i=0;i<prevGray.length;i++) prevGray[i] = 128;
+updateCounts();
+
+</script>
+</body>
+</html>
